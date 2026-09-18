@@ -1,0 +1,102 @@
+# OpenTelemetry Collector — receives telemetry from every Claude Code session
+# on this machine and fans it out to Prometheus (metrics) and Loki (events).
+#
+# Why a collector at all, when Claude Code can expose Prometheus itself
+# (OTEL_METRICS_EXPORTER=prometheus)? Because that exporter binds a port
+# inside the CLI process: the second concurrent session fails to bind, and
+# every session would need to be a separate Prometheus scrape target with a
+# lifetime of minutes. A collector gives the CLI one fixed address to push
+# to, and Prometheus one stable target to scrape.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+  # Claude Code does not guarantee a service.name, and Loki turns that
+  # resource attribute into the `service_name` stream label that every log
+  # query selects on. Pinning it here keeps the dashboard's Loki queries
+  # valid no matter what the CLI reports.
+  resource/identity:
+    attributes:
+      - key: service.name
+        value: claude-code
+        action: upsert
+
+  # Guard against one runaway session flooding the stack.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+    # Keep metric names as Claude Code emits them, minus the dots:
+    # claude_code.cost.usage -> claude_code_cost_usage. The default appends
+    # the unit and counter suffixes as well, giving the rather less readable
+    # claude_code_cost_usage_USD_total. The dashboard queries assume the
+    # names below, so if you change this, change them too.
+    #
+    # NOTE: the older `add_metric_suffixes: false` option is silently
+    # ignored by this exporter as of collector 0.161.0 -- it parses without
+    # complaint and changes nothing. translation_strategy is the one that
+    # works. Verify after any collector upgrade with:
+    #   make verify   (or see README "Checking the metric names")
+    translation_strategy: UnderscoreEscapingWithoutSuffixes
+
+    # How long the exporter keeps re-publishing a series after the session
+    # that owned it exited. This does NOT limit how far back you can query:
+    # Prometheus has already stored those samples and keeps them for its
+    # own retention (365d, see docker-compose.yml), so the totals on the
+    # dashboard span the full history either way.
+    #
+    # Keep it SHORT. A long expiration republishes every finished session's
+    # final value on every scrape, which writes a flat line into Prometheus
+    # for as long as it lasts -- inflating storage and, worse, making a
+    # session look active hours after it ended. 10m is enough to survive a
+    # scrape gap without smearing history.
+    metric_expiration: 10m
+
+    # Carries OTEL_RESOURCE_ATTRIBUTES (department, team.id, ...) through to
+    # Prometheus as labels, for attributing spend across a team.
+    #
+    # `included` is a list of EXACT attribute names, not patterns: a ".*"
+    # entry matches nothing at all and silently drops every attribute. Add
+    # each key you set in OTEL_RESOURCE_ATTRIBUTES here, or it will not
+    # reach the dashboard.
+    resource_constant_labels:
+      included:
+        - department
+        - team.id
+
+  # Loki 3.x ingests OTLP natively at /otlp — no deprecated loki exporter.
+  # `otlp_http` is the current spelling; the old `otlphttp` alias still works
+  # but warns on every start.
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/identity, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/identity, batch]
+      exporters: [otlp_http/loki]
