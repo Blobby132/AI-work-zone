@@ -1,0 +1,18 @@
+# Prometheus scrapes the collector, not Claude Code directly — see the note
+# at the top of otel/collector.yaml for why.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: claude-code
+    static_configs:
+      - targets: ['otel-collector:8889']
+        labels:
+          source: otel-collector
+
+  # The stack watching itself, so a scrape failure is visible rather than
+  # looking like "Claude Code produced no data".
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
